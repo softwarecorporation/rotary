@@ -14,6 +14,18 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  lite:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+      - run: cargo build --locked --lib --no-default-features --features lite --target wasm32-unknown-unknown
+      - run: cargo test --locked --no-default-features --features lite --lib --test lite
+      - run: cargo clippy --locked --no-default-features --features lite --lib --test lite -- -D warnings
+      - run: cargo check --locked --lib --features lite
   check:
     runs-on: ubuntu-latest
     steps:

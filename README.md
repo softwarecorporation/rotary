@@ -6,6 +6,19 @@
 
 Pure agent harness engine. Models write; rotary gives them tools, memory, loops, permissions, sessions, and control planes. Hosts embed it as a library or drive it over IPC; policy and UI stay in the host.
 
+## Wasm and Cloudflare Workers
+
+The `lite` feature exposes a real, resumable `rx4::lite::Agent` without a native runtime, filesystem, process executor, HTTP client, or random-number dependency:
+
+```toml
+[dependencies]
+rx4 = { git = "https://github.com/tschk/rotary", default-features = false, features = ["lite"] }
+```
+
+Pin the Git revision and commit `Cargo.lock` for reproducible builds. Version 0.8 is source-only until registry publication is separately authorized. See [the lite host contract](docs/lite.md) for the API and supported capabilities. [Roundhouse](https://github.com/tschk/roundhouse) supplies a real Workers/Wasm host, durable alarm scheduling, permission-gated application recovery, and independent verification.
+
+Native remains the default. Features are additive: `native,lite` exposes both agents on a native target. Existing native feature flags imply `native`; hosts that previously disabled all defaults without selecting any feature must now select `native` explicitly. Use only `lite` for Wasm; enabling native tools/providers on wasm32 is unsupported.
+
 ## Quick start
 
 ### Library
