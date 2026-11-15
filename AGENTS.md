@@ -25,7 +25,7 @@ Tool gate shape (pi `beforeToolCall`):
 
 ## Stack
 
-- Rust 2021 (MSRV 1.88), `#![forbid(unsafe_code)]`
+- Rust 2021 (MSRV 1.89), `#![forbid(unsafe_code)]`
 - tokio (async runtime, feature-gated)
 - serde / serde_json
 - praefectus 0.8.0 (crates.io, computer-use, feature-gated)
