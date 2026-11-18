@@ -69,12 +69,7 @@ impl CancellationHandle {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolCall {
-    pub id: String,
-    pub name: String,
-    pub arguments: String,
-}
+pub use crate::tool_call::ToolCall;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolResult {
