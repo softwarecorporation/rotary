@@ -618,6 +618,7 @@ async fn inherited_required_os_sandbox_refuses_shell_without_a_runner() {
     parent.set_policy(Policy::full_access());
     let mut authority = parent.subagent_authority();
     authority.policy.enable_os_sandbox = true;
+    authority.os_sandbox = None;
     authority.os_sandbox_failed = true;
     let mut manager = SubagentManager::new()
         .with_tools(Arc::new(tools))
