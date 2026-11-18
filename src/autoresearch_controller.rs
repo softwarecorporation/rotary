@@ -465,7 +465,11 @@ impl AutoresearchController {
         config.validate()?;
         let requested_root = root.into();
         let root = tokio::fs::canonicalize(&requested_root).await?;
-        if !root.is_dir() {
+        if !tokio::fs::metadata(&root)
+            .await
+            .map(|m| m.is_dir())
+            .unwrap_or(false)
+        {
             return Err(AutoresearchControllerError::InvalidConfig(format!(
                 "workspace is not a directory: {}",
                 root.display()
