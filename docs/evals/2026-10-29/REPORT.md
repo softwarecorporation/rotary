@@ -72,14 +72,14 @@ remain deferred; do not use this run to claim statistical superiority.
 
 ## Execution, provenance and durable evidence
 
-- [Calibration run](https://github.com/tschk/rotary/actions/runs/40885026931):
+- [Calibration run](https://github.com/softwarecorporation/rotary/actions/runs/40885026931):
   codex 7/10 and tk 6/10, every individual verdict reproduced; reference
   controls 10/10 passed, no exclusions.
-- [Full run](https://github.com/tschk/rotary/actions/runs/40887385079):
+- [Full run](https://github.com/softwarecorporation/rotary/actions/runs/40887385079):
   2026-10-29 14:01:24–17:18:04 UTC, 3h 16m 40s including runner queues;
   approximately 28.31 runner-hours across 20 shards, $0 public hosted
   Actions compute, no paid model calls or rented host.
-- [Execution code and reviewed prediction bundle](https://github.com/tschk/rotary/tree/342d0da40c05bd6a02497b6c7bf5948d8ffd2a99):
+- [Execution code and reviewed prediction bundle](https://github.com/softwarecorporation/rotary/tree/342d0da40c05bd6a02497b6c7bf5948d8ffd2a99):
   execution-only branch, not a branch to merge. Workflow is manual-only.
   Prediction SHA-256:
   `8fe60459ced85ec4370ee54fd88e1910a42ae41040e4978bf864a68547de554e`.

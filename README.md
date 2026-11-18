@@ -15,7 +15,7 @@ The `lite` feature exposes a real, resumable `rx4::lite::Agent` without a native
 rx4 = { version = "0.8", default-features = false, features = ["lite"] }
 ```
 
-Commit `Cargo.lock` for reproducible builds. See [the lite host contract](docs/lite.md) for the API and supported capabilities. [Roundhouse](https://github.com/tschk/roundhouse) supplies a real Workers/Wasm host, durable alarm scheduling, permission-gated application recovery, and independent verification.
+Commit `Cargo.lock` for reproducible builds. See [the lite host contract](docs/lite.md) for the API and supported capabilities. [Roundhouse](https://github.com/softwarecorporation/roundhouse) supplies a real Workers/Wasm host, durable alarm scheduling, permission-gated application recovery, and independent verification.
 
 Native remains the default. Features are additive: `native,lite` exposes both agents on a native target. Existing native feature flags imply `native`; hosts that previously disabled all defaults without selecting any feature must now select `native` explicitly. Use only `lite` for Wasm; enabling native tools/providers on wasm32 is unsupported.
 
@@ -128,8 +128,8 @@ The engine owns the tagged edit protocol (`rx4::hashline`), the one-way investig
 - [Documentation index](docs/README.md)
 - [Install](docs/INSTALL.md) · [Features](docs/FEATURES.md) · [Providers](docs/PROVIDERS.md) · [Events](docs/EVENTS.md)
 - [Hosting guide](docs/HOSTS.md) · [Architecture](docs/ARCHITECTURE.md) · [Computer-use](docs/COMPUTER-USE.md)
-- [telekinesis](https://github.com/tschk/telekinesis) — CLI/TUI product host
-- [apollo](https://github.com/tschk/apollo) — AI agent host
+- [telekinesis](https://github.com/softwarecorporation/telekinesis) — CLI/TUI product host
+- [apollo](https://github.com/softwarecorporation/apollo) — AI agent host
 
 ## License
 
