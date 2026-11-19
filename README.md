@@ -2,9 +2,28 @@
 
 [![crates.io](https://img.shields.io/crates/v/rx4.svg)](https://crates.io/crates/rx4)
 [![License: MPL-2.0](https://img.shields.io/badge/License-MPL--2.0-blue.svg)](LICENSE)
-[![MSRV: 1.88](https://img.shields.io/badge/MSRV-1.88-blue.svg)](https://blog.rust-lang.org/2025/06/26/Rust-1.88.0.html)
+[![MSRV: 1.89](https://img.shields.io/badge/MSRV-1.89-blue.svg)](https://www.rust-lang.org)
 
 Pure agent harness engine. Models write; rotary gives them tools, memory, loops, permissions, sessions, and control planes. Hosts embed it as a library or drive it over IPC; policy and UI stay in the host.
+
+## Wasm and Cloudflare Workers
+
+The `lite` feature exposes a real, resumable `rx4::lite::Agent` without a native runtime, filesystem, process executor, HTTP client, or random-number dependency:
+
+```toml
+[dependencies]
+rx4 = { version = "0.8", default-features = false, features = ["lite"] }
+```
+
+Commit `Cargo.lock` for reproducible builds. See [the lite host contract](docs/lite.md) for the API and supported capabilities. [Roundhouse](https://github.com/softwarecorporation/roundhouse) supplies a real Workers/Wasm host, durable alarm scheduling, permission-gated application recovery, and independent verification.
+
+Native remains the default. Features are additive: `native,lite` exposes both agents on a native target. Existing native feature flags imply `native`; hosts that previously disabled all defaults without selecting any feature must now select `native` explicitly. Use only `lite` for Wasm; enabling native tools/providers on wasm32 is unsupported.
+
+## Native dependency security
+
+Rotary requires Rust 1.89 and uses rusqlite 0.41 and rustix at least 1.1.6 for patched native SQLite and Linux support. Native memory/session features remain supported. Lite does not enable either dependency.
+
+The optional `zkr` dependency requires the patched [zkr 0.5.1 registry release](https://crates.io/crates/zkr/0.5.1). Cargo resolves it directly from crates.io; no Git dependency or sibling checkout is required.
 
 ## Quick start
 
@@ -109,8 +128,8 @@ The engine owns the tagged edit protocol (`rx4::hashline`), the one-way investig
 - [Documentation index](docs/README.md)
 - [Install](docs/INSTALL.md) · [Features](docs/FEATURES.md) · [Providers](docs/PROVIDERS.md) · [Events](docs/EVENTS.md)
 - [Hosting guide](docs/HOSTS.md) · [Architecture](docs/ARCHITECTURE.md) · [Computer-use](docs/COMPUTER-USE.md)
-- [telekinesis](https://github.com/tschk/telekinesis) — CLI/TUI product host
-- [apollo](https://github.com/tschk/apollo) — AI agent host
+- [telekinesis](https://github.com/softwarecorporation/telekinesis) — CLI/TUI product host
+- [apollo](https://github.com/softwarecorporation/apollo) — AI agent host
 
 ## License
 

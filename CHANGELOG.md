@@ -75,7 +75,18 @@ Patch release on crates.io `0.7.1` (git `Cargo.toml` had lagged at `0.6.5`).
 
 ## Unreleased
 
+### Breaking
+- `SessionRecoveryReport` has a new public `integrity_verified` field. Struct
+  literals must supply it, and exhaustive destructuring must include it or use
+  `..`.
+
 ### Added
+- `McpClient::read_resource_result` preserves all resource parts and metadata
+  as JSON; the existing first-text `read_resource` remains unchanged.
+- Session recovery with unverified or skipped records, and interrupted worker
+  restoration, write warnings to standard error even without a logging subscriber.
+- Interrupted worker recovery reports identify recorded tool calls without a
+  result and explain why they were not replayed; snapshots may omit effects.
 - Durable session `projection` ledger so semantic compaction survives the next provider request.
 - Typed `Event::Recovery` for empty-turn Prefill/Nudge and stuck-tool recovery.
 - Unified `exec` tool (`spawn` / `stdin` / `wait` / `kill`) with drained pipes and `ProcessStart` / `ProcessEnd`.

@@ -13,6 +13,72 @@
 
 ## Next
 
+### Engine capability gaps
+
+These are proposals, not completed features. Hosts continue to choose policy
+and scheduling. Each item needs an end-to-end contract test before release.
+
+- **Authority remains patched, not structurally proven.** Child construction
+  now intersects inherited policy, scope, tool selection and approval, and
+  scope changes retain the inherited ceiling. Regression tests cover two
+  previously escaping paths. However, authority is still distributed across
+  mutable `Agent` fields, policy, authorizers and tool-specific bridges; it is
+  not encoded as a single non-widening capability in the type system. Audit
+  every delegation and tool-dispatch path, including nested children and script
+  bridges, against one authority contract. Move enforcement to a mandatory
+  boundary that cannot be replaced by a scope transition or forgotten by a
+  new tool. Extend the matrix with host allow/deny lists, shell rules, path
+  boundaries, argument encodings and approval outcomes; generate adversarial
+  paths and commands and compare child decisions against the actual parent
+  gate across nested delegations and every dispatch path. Arbitrary host
+  authorizers can be stateful, so require an explicit non-widening contract
+  or a mandatory parent-gate intersection rather than claiming enumeration
+  proves all callbacks. Keep host-owned policy and approval semantics. See
+  `src/agent/mod.rs`, `src/subagent.rs`, and `src/permissions.rs`.
+- **Resource budgets for delegated work.** Script helpers have a Linux
+  per-process address-space cap and bounded parent bridge operations. Those
+  limits do not bound aggregate parent memory across concurrent scripts or
+  blocking host callbacks; hosts must limit concurrency and parent resources.
+  Provide a shared, host-configurable aggregate budget with cancellation and
+  accounting across helpers and bridges. See `src/tools/script.rs` and
+  `src/tools/script/worker.rs`.
+- **Non-Linux script support.** The supervised Lua helper fails closed outside
+  Linux because its address-space quota is not implemented there. Hosts on
+  those platforms cannot use the `script` tool, including its Lua processing
+  and read/list/grep bridges. Add an equivalent enforced quota before enabling
+  it; do not silently run without one.
+- **Recoverable sessions.** JSONL saves use atomic replacement and checksums;
+  `load_jsonl_with_report` identifies skipped records and whether the envelope
+  was verified. Legacy files have no checksum, so truncation or a missing
+  header cannot be distinguished from legacy data. Hosts that require
+  integrity must reject unverified reports. Headerless legacy session reading
+  remains supported throughout 0.x and is planned for removal in 1.0. A loaded
+  legacy session is written with an integrity header and checksum on its next
+  successful `save_jsonl`; saving does not restore skipped records or verify
+  the original file. Loads with unverified or skipped records warn on standard
+  error, but hosts that discard standard error can miss the warning. Preserve
+  fork, projection, and artifact references during recovery. See `src/session.rs`.
+- **MCP concurrency and rich resources.** `McpClient` holds one mutex across
+  each request. `read_resource_result` preserves all resource content parts
+  and metadata as JSON; the older `read_resource` returns the first text item.
+  Discovery follows tool and resource pagination. Support concurrent request IDs,
+  cancellation, and typed resource contents.
+  Test against a server that sends out-of-order replies and multi-part resources.
+  See `src/mcp.rs`.
+- **Observable provider retries.** The agent retries transient stream failures
+  with fixed backoff in `Agent::prompt`. Expose retry attempts and terminal
+  reasons to hosts, and verify that partial text or tool calls are not repeated
+  as completed work after a stream failure. See `src/agent/mod.rs` and
+  `src/provider.rs`.
+- **Composable long-running work.** Background tool results, bounded tool
+  pipelines and durable worker handles exist. Restored interrupted workers
+  report recorded calls without results; they are not replayed because their
+  effects may already have occurred. Snapshots may omit effects, so hosts must
+  not treat the report as exhaustive. Restoration warns on standard error,
+  which hosts must retain. Expose checkpoints and cancellation to
+  hosts. Keep approval and scheduling with the host. See `src/agent/mod.rs`,
+  `src/subagent.rs`, and `src/agent/pipeline.rs`.
+
 ### P0
 1. [x] Stream-JSON / noninteractive protocol — `rx4 exec --stream-json` NDJSON events (0.3.8)
 2. [x] Approval UX hooks — `Event::ApprovalRequired(ApprovalRequest)` rich ask payload (0.3.8)

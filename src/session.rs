@@ -6,12 +6,13 @@ use crate::provider::{Message, Role};
 use crate::todo::TodoState;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 
 /// Maximum file size in bytes for session JSONL files (10 MB).
 /// Rejects files larger than this to prevent unbounded memory allocation on import.
 const MAX_SESSION_FILE_BYTES: u64 = 10 * 1024 * 1024;
+const SESSION_HEADER: &str = "{\"type\":\"rx4_session_integrity\",\"version\":1}\n";
 
 /// Securely read a session file, preventing unbounded memory allocation from
 /// arbitrary user-provided paths (like `/dev/zero`) and blocking on named pipes.
@@ -70,6 +71,15 @@ pub struct SessionProjection {
     pub archived_ids: Vec<u64>,
     #[serde(default)]
     pub step: ProjectionStep,
+}
+
+/// JSONL records that could not be restored, using one-based line numbers.
+#[must_use = "inspect skipped records and session integrity before using recovered data"]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRecoveryReport {
+    pub skipped_lines: Vec<usize>,
+    /// False for legacy files that have no integrity envelope.
+    pub integrity_verified: bool,
 }
 
 /// Kind of model-retrievable payload retained outside the provider context.
@@ -308,7 +318,7 @@ impl Session {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
         std::fs::create_dir_all(dir)?;
         let path = dir.join(format!("{}.jsonl", self.id));
-        let mut content = String::new();
+        let mut content = String::from(SESSION_HEADER);
         let redactor = crate::secrets::Redactor::new();
         for entry in &self.entries {
             let mut safe_entry = entry.clone();
@@ -345,46 +355,149 @@ impl Session {
             );
             content.push('\n');
         }
-        std::fs::write(&path, content)?;
+        use sha2::{Digest, Sha256};
+        let digest = format!("{:x}", Sha256::digest(content.as_bytes()));
+        content.push_str(
+            &serde_json::json!({"type":"rx4_session_checksum","sha256":digest}).to_string(),
+        );
+        content.push('\n');
+        if content.len() as u64 > MAX_SESSION_FILE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "session exceeds maximum file size",
+            ));
+        }
+        let mut temp = tempfile::NamedTempFile::new_in(dir)?;
+        temp.write_all(content.as_bytes())?;
+        temp.as_file().sync_all()?;
+        temp.persist(&path).map_err(|error| error.error)?;
+        #[cfg(unix)]
+        std::fs::File::open(dir)?.sync_all()?;
         Ok(path)
     }
 
     pub fn load_jsonl(path: &std::path::Path) -> std::io::Result<Self> {
+        Self::load_jsonl_with_report(path).map(|(session, _)| session)
+    }
+
+    /// Load recoverable records and report every nonempty record that was skipped.
+    pub fn load_jsonl_with_report(
+        path: &std::path::Path,
+    ) -> std::io::Result<(Self, SessionRecoveryReport)> {
         let content = read_limited_file(path)?;
+        let integrity_verified = content.starts_with(SESSION_HEADER);
+        if !integrity_verified
+            && content
+                .lines()
+                .next()
+                .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .and_then(|value| {
+                    value
+                        .get("type")
+                        .and_then(|kind| kind.as_str())
+                        .map(str::to_owned)
+                })
+                .as_deref()
+                == Some("rx4_session_integrity")
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "unsupported or invalid session integrity header",
+            ));
+        }
+        let content = if integrity_verified {
+            use sha2::{Digest, Sha256};
+            let invalid = || {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "session integrity check failed",
+                )
+            };
+            let without_last_newline = content.strip_suffix('\n').ok_or_else(invalid)?;
+            let (body, footer) = without_last_newline.rsplit_once('\n').ok_or_else(invalid)?;
+            let footer: serde_json::Value = serde_json::from_str(footer).map_err(|_| invalid())?;
+            let expected = format!("{:x}", Sha256::digest(format!("{body}\n").as_bytes()));
+            if footer.get("type").and_then(|value| value.as_str()) != Some("rx4_session_checksum")
+                || footer.get("sha256").and_then(|value| value.as_str()) != Some(expected.as_str())
+            {
+                return Err(invalid());
+            }
+            body.strip_prefix(SESSION_HEADER).ok_or_else(invalid)?
+        } else {
+            content.as_str()
+        };
         let id = path.file_stem().unwrap().to_string_lossy().to_string();
         let mut session = Self::new(id.clone(), id);
-        for line in content.lines() {
+        let mut skipped_lines = Vec::new();
+        let line_offset = usize::from(integrity_verified);
+        for (index, line) in content.lines().enumerate() {
             if line.is_empty() {
                 continue;
             }
             let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                skipped_lines.push(index + 1 + line_offset);
                 continue;
             };
-            if value.get("type").and_then(|value| value.as_str()) == Some("session_todos") {
-                if let Some(todos) = value.get("todos") {
-                    if let Ok(todos) = serde_json::from_value(todos.clone()) {
-                        session.todos = todos;
-                    }
+            let restored = if value.get("type").and_then(|value| value.as_str())
+                == Some("session_todos")
+            {
+                if let Some(todos) = value
+                    .get("todos")
+                    .and_then(|todos| serde_json::from_value(todos.clone()).ok())
+                {
+                    session.todos = todos;
+                    true
+                } else {
+                    false
                 }
             } else if value.get("type").and_then(|value| value.as_str()) == Some("projection") {
                 if let Ok(projection) = serde_json::from_value::<SessionProjection>(value) {
+                    let previous = session.projections.len();
                     session.record_projection(projection);
+                    session.projections.len() != previous
+                } else {
+                    false
                 }
             } else if value.get("type").and_then(|value| value.as_str()) == Some("context_artifact")
             {
                 if let Ok(artifact) = serde_json::from_value::<ContextArtifact>(value) {
                     if crate::tools::common::validate_identifier(&artifact.reference).is_ok() {
+                        let previous = session.artifacts.len();
                         session.record_artifact(artifact);
+                        session.artifacts.len() != previous
+                    } else {
+                        false
                     }
+                } else {
+                    false
                 }
             } else if let Ok(entry) = serde_json::from_value::<Entry>(value) {
                 if entry.id >= session.next_id {
                     session.next_id = entry.id + 1;
                 }
                 session.entries.push(entry);
+                true
+            } else {
+                false
+            };
+            if !restored {
+                skipped_lines.push(index + 1 + line_offset);
             }
         }
-        Ok(session)
+        if !integrity_verified || !skipped_lines.is_empty() {
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "WARNING: session recovery requires attention: integrity_verified={integrity_verified}, skipped_records={}; inspect load_jsonl_with_report before using recovered data",
+                skipped_lines.len()
+            );
+        }
+        Ok((
+            session,
+            SessionRecoveryReport {
+                skipped_lines,
+                integrity_verified,
+            },
+        ))
     }
 
     /// Export Codex/rollout-friendly JSONL (one object per line).
@@ -908,6 +1021,122 @@ not valid json at all
         assert_eq!(loaded.entries.len(), 1);
         assert_eq!(loaded.entries[0].content, "valid message");
         assert!(loaded.todos.items.is_empty());
+        let (recovered, report) = Session::load_jsonl_with_report(&path).unwrap();
+        assert_eq!(recovered.entries[0].content, "valid message");
+        assert_eq!(report.skipped_lines, vec![3, 4]);
+        assert!(!report.integrity_verified);
+    }
+
+    #[test]
+    fn saving_legacy_session_adds_integrity_envelope() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.jsonl");
+        let entry = serde_json::json!({
+            "id": 1,
+            "parent_id": null,
+            "role": "user",
+            "content": "preserved message"
+        });
+        std::fs::write(&path, format!("{entry}\n")).unwrap();
+
+        let (session, report) = Session::load_jsonl_with_report(&path).unwrap();
+        assert!(!report.integrity_verified);
+        assert!(report.skipped_lines.is_empty());
+        assert_eq!(session.save_jsonl(dir.path()).unwrap(), path);
+
+        let (upgraded, report) = Session::load_jsonl_with_report(&path).unwrap();
+        assert!(report.integrity_verified);
+        assert!(report.skipped_lines.is_empty());
+        assert_eq!(upgraded.entries.len(), 1);
+        assert_eq!(upgraded.entries[0].content, "preserved message");
+    }
+
+    #[test]
+    fn legacy_load_warns_even_if_report_is_discarded() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "session::tests::load_jsonl_recovers_from_malformed_lines",
+                "--nocapture",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("WARNING: session recovery requires attention"));
+        assert!(stderr.contains("integrity_verified=false"));
+    }
+
+    #[test]
+    fn saved_session_detects_truncation_and_content_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = Session::new("integrity", "test");
+        session.append(Role::User, "original");
+        let path = session.save_jsonl(dir.path()).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(
+            Session::load_jsonl_with_report(&path)
+                .unwrap()
+                .1
+                .integrity_verified
+        );
+        assert_eq!(
+            Session::load_jsonl(&path).unwrap().entries[0].content,
+            "original"
+        );
+
+        let changed = String::from_utf8(bytes.clone())
+            .unwrap()
+            .replace("original", "modified");
+        std::fs::write(&path, changed).unwrap();
+        assert!(Session::load_jsonl(&path).is_err());
+
+        let last_line = bytes[..bytes.len() - 1]
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .unwrap()
+            + 1;
+        std::fs::write(&path, &bytes[..last_line]).unwrap();
+        assert!(Session::load_jsonl(&path).is_err());
+        let unsupported =
+            String::from_utf8(bytes)
+                .unwrap()
+                .replacen("\"version\":1", "\"version\":2", 1);
+        std::fs::write(&path, unsupported).unwrap();
+        assert!(Session::load_jsonl(&path).is_err());
+    }
+
+    #[test]
+    fn oversized_save_preserves_previous_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = Session::new("bounded", "test");
+        session.append(Role::User, "preserved");
+        let path = session.save_jsonl(dir.path()).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        session.todos.items.push(crate::todo::TodoItem {
+            id: "large".into(),
+            content: "x".repeat(MAX_SESSION_FILE_BYTES as usize),
+            status: crate::todo::TodoStatus::Pending,
+            creation_confidence: 90,
+            completion_confidence: None,
+            verification_attempts: 0,
+        });
+        assert!(session.save_jsonl(dir.path()).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), original);
+    }
+
+    #[test]
+    fn saving_again_replaces_the_previous_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = Session::new("replace", "test");
+        session.append(Role::User, "first");
+        let path = session.save_jsonl(dir.path()).unwrap();
+        session.append(Role::Assistant, "second");
+        session.save_jsonl(dir.path()).unwrap();
+        let (loaded, report) = Session::load_jsonl_with_report(&path).unwrap();
+        assert!(report.integrity_verified);
+        assert_eq!(loaded.entries.len(), 2);
+        assert_eq!(loaded.entries[1].content, "second");
     }
 
     #[test]
@@ -994,30 +1223,14 @@ not valid json at all
         let path = s.save_jsonl(dir.path()).unwrap();
         assert_eq!(path, dir.path().join("test-session.jsonl"));
 
-        let content = std::fs::read_to_string(path).unwrap();
-        let lines: Vec<&str> = content.lines().collect();
-        assert_eq!(lines.len(), 2);
-
-        let entry: Entry = serde_json::from_str(lines[0]).unwrap();
-        assert_eq!(entry.role, Role::User);
-        assert_eq!(entry.content, "hello [REDACTED:api-key]");
-
+        let (loaded, report) = Session::load_jsonl_with_report(&path).unwrap();
+        assert!(report.integrity_verified);
+        assert!(report.skipped_lines.is_empty());
+        assert_eq!(loaded.entries[0].role, Role::User);
+        assert_eq!(loaded.entries[0].content, "hello [REDACTED:api-key]");
         assert!(s.entries[0].content.contains(&secret));
-
-        let todos: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
-        assert_eq!(
-            todos.get("type").unwrap().as_str().unwrap(),
-            "session_todos"
-        );
-        let items = todos
-            .get("todos")
-            .unwrap()
-            .get("items")
-            .unwrap()
-            .as_array()
-            .unwrap();
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].get("content").unwrap().as_str().unwrap(), "a task");
+        assert_eq!(loaded.todos.items.len(), 1);
+        assert_eq!(loaded.todos.items[0].content, "a task");
     }
 
     #[cfg(feature = "sqlite-sessions")]

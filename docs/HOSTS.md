@@ -82,4 +82,4 @@ socket only).
 
 ## apollo
 
-[apollo](https://github.com/tschk/apollo) is an AI agent host along the likes of Hermes. omi PR + beta versions also embed rotary.
+[apollo](https://github.com/softwarecorporation/apollo) is an AI agent host along the likes of Hermes. omi PR + beta versions also embed rotary.
