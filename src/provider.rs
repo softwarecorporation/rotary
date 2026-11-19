@@ -182,6 +182,8 @@ pub struct OpenAIProvider {
     prompt_cache: crate::prompt_cache::PromptCacheConfig,
     /// Headers every request carries (gateway routing, beta flags).
     extra_headers: reqwest::header::HeaderMap,
+    /// Only models whose adaptive request has been accepted by this endpoint.
+    adaptive_thinking_models: DashMap<String, ()>,
 }
 
 #[cfg(feature = "providers")]
@@ -229,6 +231,7 @@ impl OpenAIProvider {
             provider_name: provider_name.into(),
             prompt_cache,
             extra_headers: reqwest::header::HeaderMap::new(),
+            adaptive_thinking_models: DashMap::new(),
         }
     }
 
@@ -338,7 +341,7 @@ impl Provider for OpenAIProvider {
         tools: &[serde_json::Value],
         reasoning_effort: Option<&str>,
     ) -> Result<StreamResult, ProviderError> {
-        let body = if self.provider_id == "anthropic" {
+        let mut body = if self.provider_id == "anthropic" {
             anthropic_request(
                 messages,
                 system,
@@ -363,18 +366,40 @@ impl Provider for OpenAIProvider {
         } else {
             "chat/completions"
         };
-        let response = self
-            .request(&body, endpoint)
-            .send()
-            .await
-            .map_err(|e| ProviderError::Http(e.to_string()))?;
-
-        if !response.status().is_success() {
+        let anthropic_effort = reasoning_effort.filter(|_| self.provider_id == "anthropic");
+        let mut adaptive =
+            anthropic_effort.is_some() && self.adaptive_thinking_models.contains_key(model);
+        if let Some(effort) = anthropic_effort.filter(|_| adaptive) {
+            use_adaptive_thinking(&mut body, effort);
+        }
+        // Negotiate only before returning a stream. The adaptive flag bounds this
+        // to one retry, including when the adaptive request itself is rejected.
+        let response = loop {
+            let response = self
+                .request(&body, endpoint)
+                .send()
+                .await
+                .map_err(|e| ProviderError::Http(e.to_string()))?;
+            if response.status().is_success() {
+                if adaptive {
+                    self.adaptive_thinking_models.insert(model.to_owned(), ());
+                }
+                break response;
+            }
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
+            if let Some(effort) = anthropic_effort.filter(|_| {
+                !adaptive
+                    && status == reqwest::StatusCode::BAD_REQUEST
+                    && requires_adaptive_thinking(&text)
+            }) {
+                use_adaptive_thinking(&mut body, effort);
+                adaptive = true;
+                continue;
+            }
             error!("provider error {status}: {text}");
             return Err(ProviderError::Api(format!("{status}: {text}")));
-        }
+        };
 
         let byte_stream = response.bytes_stream();
         let sse_stream = eventsource_stream::Eventsource::eventsource(byte_stream);
@@ -403,6 +428,27 @@ impl Provider for OpenAIProvider {
 
         Ok(Box::new(Box::pin(mapped)))
     }
+}
+
+#[cfg(feature = "providers")]
+fn requires_adaptive_thinking(text: &str) -> bool {
+    let Ok(error) = serde_json::from_str::<serde_json::Value>(text) else {
+        return false;
+    };
+    error["error"]["message"].as_str().is_some_and(|message| {
+        message.contains("\"thinking.type.enabled\" is not supported for this model.")
+            && message.contains(
+                "Use \"thinking.type.adaptive\" and \"output_config.effort\" to control thinking behavior.",
+            )
+    })
+}
+
+#[cfg(feature = "providers")]
+fn use_adaptive_thinking(body: &mut serde_json::Value, effort: &str) {
+    // Preserve the host's effort (including xhigh), rather than assuming max
+    // support or inferring an effort mapping from the model's name.
+    body["thinking"] = serde_json::json!({"type": "adaptive"});
+    body["output_config"] = serde_json::json!({"effort": effort});
 }
 
 #[cfg(feature = "providers")]
@@ -1125,5 +1171,253 @@ mod tests {
             false,
         );
         assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[cfg(feature = "providers")]
+    mod thinking_negotiation {
+        use super::*;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const INCOMPATIBLE: &str = "\"thinking.type.enabled\" is not supported for this model. Use \"thinking.type.adaptive\" and \"output_config.effort\" to control thinking behavior.";
+        const DONE: &str = "data: {\"type\":\"message_stop\"}\n\n";
+
+        fn rejection() -> String {
+            serde_json::json!({"type": "error", "error": {
+                "type": "invalid_request_error", "message": INCOMPATIBLE
+            }})
+            .to_string()
+        }
+
+        struct Server {
+            url: String,
+            stop: tokio::sync::oneshot::Sender<()>,
+            task: tokio::task::JoinHandle<Vec<serde_json::Value>>,
+        }
+
+        impl Server {
+            async fn start(responses: Vec<(u16, String)>) -> Self {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!("http://{}", listener.local_addr().unwrap());
+                let (stop, mut stopped) = tokio::sync::oneshot::channel();
+                let task = tokio::spawn(async move {
+                    let mut requests = Vec::new();
+                    loop {
+                        let (mut socket, _) = tokio::select! {
+                            _ = &mut stopped => break,
+                            accepted = listener.accept() => accepted.unwrap(),
+                        };
+                        let mut raw = Vec::new();
+                        let (header_end, length) = loop {
+                            let mut chunk = [0; 4096];
+                            let n = socket.read(&mut chunk).await.unwrap();
+                            assert_ne!(n, 0, "request ended before headers");
+                            raw.extend_from_slice(&chunk[..n]);
+                            if let Some(end) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                                let headers = String::from_utf8_lossy(&raw[..end]);
+                                let length = headers
+                                    .lines()
+                                    .find_map(|line| {
+                                        let (key, value) = line.split_once(':')?;
+                                        key.eq_ignore_ascii_case("content-length")
+                                            .then(|| value.trim().parse::<usize>().unwrap())
+                                    })
+                                    .unwrap();
+                                break (end + 4, length);
+                            }
+                        };
+                        while raw.len() < header_end + length {
+                            let mut chunk = [0; 4096];
+                            let n = socket.read(&mut chunk).await.unwrap();
+                            assert_ne!(n, 0, "request ended before body");
+                            raw.extend_from_slice(&chunk[..n]);
+                        }
+                        requests.push(
+                            serde_json::from_slice(&raw[header_end..header_end + length]).unwrap(),
+                        );
+                        let fallback = (500, "unexpected request".to_string());
+                        let (status, body) = responses.get(requests.len() - 1).unwrap_or(&fallback);
+                        let response = format!(
+                            "HTTP/1.1 {status} Test\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        socket.write_all(response.as_bytes()).await.unwrap();
+                    }
+                    requests
+                });
+                Self { url, stop, task }
+            }
+
+            fn provider(&self, id: &str) -> OpenAIProvider {
+                OpenAIProvider::with_base_url(&self.url, "", id, "test")
+                    .with_prompt_cache(crate::prompt_cache::PromptCacheConfig::disabled())
+            }
+
+            async fn finish(self) -> Vec<serde_json::Value> {
+                self.stop.send(()).unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(5), self.task)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            }
+        }
+
+        async fn call(
+            provider: &OpenAIProvider,
+            model: &str,
+            effort: Option<&str>,
+        ) -> Result<Vec<StreamEvent>, ProviderError> {
+            use futures::TryStreamExt;
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                provider
+                    .stream(&[Message::user("solve")], &None, model, &[], effort)
+                    .await?
+                    .try_collect()
+                    .await
+            })
+            .await
+            .expect("local HTTP request timed out")
+        }
+
+        fn legacy(model: &str, budget: u32) -> serde_json::Value {
+            serde_json::json!({
+                "model": model, "stream": true, "max_tokens": budget + 8192,
+                "messages": [{"role": "user", "content": "solve"}],
+                "thinking": {"type": "enabled", "budget_tokens": budget}
+            })
+        }
+
+        #[tokio::test]
+        async fn retries_explicit_rejection_once_and_remembers_only_that_model() {
+            let server = Server::start(vec![
+                (400, rejection()),
+                (200, DONE.into()),
+                (200, DONE.into()),
+                (200, DONE.into()),
+                (200, DONE.into()),
+            ])
+            .await;
+            let provider = server.provider("anthropic");
+            assert!(matches!(
+                call(&provider, "opaque-model", Some("xhigh"))
+                    .await
+                    .unwrap()[0],
+                StreamEvent::Done
+            ));
+            call(&provider, "opaque-model", Some("medium"))
+                .await
+                .unwrap();
+            call(&provider, "other-model", Some("high")).await.unwrap();
+            call(&provider, "opaque-model", None).await.unwrap();
+            let mut adaptive = legacy("opaque-model", 16384);
+            adaptive["thinking"] = serde_json::json!({"type": "adaptive"});
+            adaptive["output_config"] = serde_json::json!({"effort": "xhigh"});
+            let mut subsequent = adaptive.clone();
+            subsequent["max_tokens"] = serde_json::json!(12288);
+            subsequent["output_config"]["effort"] = serde_json::json!("medium");
+            let no_effort = serde_json::json!({
+                "model": "opaque-model", "stream": true, "max_tokens": 8192,
+                "messages": [{"role": "user", "content": "solve"}]
+            });
+            assert_eq!(
+                server.finish().await,
+                vec![
+                    legacy("opaque-model", 16384),
+                    adaptive,
+                    subsequent,
+                    legacy("other-model", 8192),
+                    no_effort,
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn legacy_haiku_remains_a_single_request() {
+            let server = Server::start(vec![(200, DONE.into())]).await;
+            call(
+                &server.provider("anthropic"),
+                "claude-haiku-4-5",
+                Some("low"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                server.finish().await,
+                vec![legacy("claude-haiku-4-5", 1024)]
+            );
+        }
+
+        #[tokio::test]
+        async fn unrelated_errors_auth_and_ordinary_providers_are_not_retried() {
+            for (id, effort, status, error) in [
+                (
+                    "anthropic",
+                    Some("high"),
+                    400,
+                    "invalid max_tokens".to_string(),
+                ),
+                (
+                    "anthropic",
+                    Some("high"),
+                    400,
+                    serde_json::json!({"error": {"message": "Use adaptive thinking"}}).to_string(),
+                ),
+                ("anthropic", Some("high"), 401, rejection()),
+                ("anthropic", Some("high"), 500, rejection()),
+                ("anthropic", None, 400, rejection()),
+                ("openai", Some("xhigh"), 400, rejection()),
+            ] {
+                let server = Server::start(vec![(status, error.clone())]).await;
+                let result = call(&server.provider(id), "unknown", effort).await;
+                assert!(
+                    matches!(result, Err(ProviderError::Api(message)) if message.contains(&error))
+                );
+                let requests = server.finish().await;
+                assert_eq!(requests.len(), 1, "{id} {status} {effort:?}");
+                if effort.is_none() || id == "openai" {
+                    assert!(requests[0].get("thinking").is_none());
+                    assert!(requests[0].get("output_config").is_none());
+                }
+                if id == "openai" {
+                    assert_eq!(requests[0]["reasoning_effort"], "xhigh");
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn rejected_adaptive_retry_is_not_cached_or_retried_again() {
+            let server = Server::start(vec![
+                (400, rejection()),
+                (400, rejection()),
+                (200, DONE.into()),
+            ])
+            .await;
+            let provider = server.provider("anthropic");
+            assert!(matches!(
+                call(&provider, "unknown", Some("high")).await,
+                Err(ProviderError::Api(_))
+            ));
+            call(&provider, "unknown", Some("high")).await.unwrap();
+            let mut adaptive = legacy("unknown", 8192);
+            adaptive["thinking"] = serde_json::json!({"type": "adaptive"});
+            adaptive["output_config"] = serde_json::json!({"effort": "high"});
+            assert_eq!(
+                server.finish().await,
+                vec![legacy("unknown", 8192), adaptive, legacy("unknown", 8192)]
+            );
+        }
+
+        #[tokio::test]
+        async fn incompatible_error_after_stream_starts_does_not_retry() {
+            let event = format!("data: {}\n\n", rejection());
+            let server = Server::start(vec![(200, event)]).await;
+            let provider = server.provider("anthropic");
+            // Existing SSE error handling is unchanged; consuming even an
+            // incompatible-thinking error event cannot trigger negotiation.
+            assert!(matches!(
+                call(&provider, "unknown", Some("high")).await,
+                Err(ProviderError::Api(message)) if message == INCOMPATIBLE
+            ));
+            assert_eq!(server.finish().await, vec![legacy("unknown", 8192)]);
+        }
     }
 }

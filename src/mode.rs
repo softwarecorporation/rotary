@@ -69,6 +69,8 @@ pub const CODING_TOOLS: &[&str] = &[
     "list_dir",
     "retrieve_context_artifact",
     "spawn_agent",
+    "list_subagents",
+    "cancel_subagent",
     "web_fetch",
     "web_search",
     "darash",
@@ -248,6 +250,14 @@ mod tests {
         let p = profile(Scope::Plan);
         assert!(tool_allowed(&p, "read_file"));
         assert!(!tool_allowed(&p, "write_file"));
+    }
+
+    #[test]
+    fn coding_allows_the_complete_subagent_lifecycle() {
+        for tool in ["spawn_agent", "list_subagents", "cancel_subagent"] {
+            assert!(tool_allowed(&profile(Scope::Coding), tool));
+            assert!(!tool_allowed(&profile(Scope::Ask), tool));
+        }
     }
 
     #[test]

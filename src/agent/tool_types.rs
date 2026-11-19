@@ -144,6 +144,9 @@ pub struct ToolContext {
     pub provider: Option<Arc<dyn Provider>>,
     /// Optional tool registry for nested agent runs.
     pub tools: Option<Arc<ToolRegistry>>,
+    /// History of the executing agent, including its current request. Read at
+    /// invocation time; a shared tool must not capture another agent's history.
+    pub session_messages: Option<Arc<parking_lot::RwLock<Vec<crate::provider::Message>>>>,
     /// Authority snapshot inherited by model-requested subagents. The agent
     /// populates this; tool implementations must not synthesize one.
     pub subagent_authority: Option<crate::subagent::SubagentAuthority>,
@@ -210,6 +213,7 @@ impl ToolContext {
             os_sandbox_required: false,
             provider: None,
             tools: None,
+            session_messages: None,
             subagent_authority: None,
             subagent_manager: None,
             subagent_parent_id: None,

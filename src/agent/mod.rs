@@ -427,6 +427,11 @@ impl BackgroundQueue {
         let mut reclaimed = Vec::new();
         let mut idx = 0;
         while idx < self.calls.len() {
+            // Earlier callsets need message delivery, not slot replacement.
+            if self.calls[idx].open_slot.is_none() {
+                idx += 1;
+                continue;
+            }
             match self.calls[idx].rx.try_recv() {
                 Ok((_, result)) => {
                     let pending = self.calls.swap_remove(idx);
@@ -582,6 +587,7 @@ pub struct Agent {
     /// budget is per-turn rather than per-agent.
     pub self_healing: Option<SelfHealingRetry>,
     pub provider: Option<Arc<dyn Provider>>,
+    subagent_provider: Option<Arc<dyn Provider>>,
     pub max_tool_iterations: usize,
     pub auto_compact_after: usize,
     /// Opt-in session todo engine. `None` preserves the historical builtin tool.
@@ -688,6 +694,7 @@ impl Agent {
             async_tools: AsyncToolsConfig::default(),
             authorizer: None,
             provider: None,
+            subagent_provider: None,
             max_tool_iterations: 50,
             auto_compact_after: 0,
             todo_config: None,
@@ -955,6 +962,12 @@ impl Agent {
 
     pub fn set_provider(&mut self, provider: Arc<dyn Provider>) {
         self.provider = Some(provider);
+    }
+
+    /// Override the provider available to nested-agent tools without changing
+    /// foreground inference. None preserves inheritance from the current agent.
+    pub fn set_subagent_provider(&mut self, provider: Option<Arc<dyn Provider>>) {
+        self.subagent_provider = provider;
     }
 
     /// Snapshot the authority that a model-requested subagent may inherit.
@@ -1718,7 +1731,6 @@ impl Agent {
         self.before_prompt_hooks(&safe_text).await;
 
         let mut tool_ctx = self.tool_context();
-        tool_ctx.provider = Some(provider.clone());
         tool_ctx.tools = Some(Arc::clone(&self.tools));
         let pending_scope = Arc::new(parking_lot::Mutex::new(None));
         tool_ctx.pending_scope = Some(Arc::clone(&pending_scope));
@@ -2858,8 +2870,12 @@ impl Agent {
         {
             tool_ctx.script_run_id = Some(self.script_run_id.clone());
         }
-        tool_ctx.provider = self.provider.clone();
+        tool_ctx.provider = self
+            .subagent_provider
+            .clone()
+            .or_else(|| self.provider.clone());
         tool_ctx.tools = Some(Arc::clone(&self.tools));
+        tool_ctx.session_messages = Some(self.messages_handle());
         tool_ctx.os_sandbox_required = self.policy.enable_os_sandbox && self.os_sandbox.is_none();
         tool_ctx.cancellation = self.turn_cancellation.reset();
         tool_ctx.hashline_sight = Arc::clone(&self.hashline_sight);
@@ -3471,6 +3487,167 @@ mod tests {
         let events = events.lock();
         assert!(events.contains(&"backgrounded".to_string()));
         assert!(events.contains(&"arrived:false".to_string()));
+    }
+
+    #[cfg(feature = "providers")]
+    #[tokio::test]
+    async fn earlier_background_result_survives_later_callset() {
+        struct RecordingProvider {
+            requests: Arc<parking_lot::Mutex<Vec<Vec<Message>>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl Provider for RecordingProvider {
+            fn id(&self) -> &str {
+                "cross-callset"
+            }
+
+            fn name(&self) -> &str {
+                "cross-callset"
+            }
+
+            async fn stream(
+                &self,
+                messages: &[Message],
+                _system: &Option<String>,
+                _model: &str,
+                _tools: &[serde_json::Value],
+                _reasoning_effort: Option<&str>,
+            ) -> Result<crate::provider::StreamResult, crate::provider::ProviderError> {
+                use crate::provider::StreamEvent;
+                let mut requests = self.requests.lock();
+                let round = requests.len();
+                requests.push(messages.to_vec());
+                let events = match round {
+                    0 | 1 => vec![
+                        Ok(StreamEvent::ToolCall(ToolCall {
+                            id: ["oracle_call", "release_call"][round].into(),
+                            name: ["oracle", "release_oracle"][round].into(),
+                            arguments: "{}".into(),
+                        })),
+                        Ok(StreamEvent::Done),
+                    ],
+                    _ => vec![
+                        Ok(StreamEvent::Delta("All done.".into())),
+                        Ok(StreamEvent::Done),
+                    ],
+                };
+                Ok(Box::new(futures::stream::iter(events)))
+            }
+        }
+
+        for is_error in [false, true] {
+            let release = Arc::new(tokio::sync::Notify::new());
+            let finished = Arc::new(tokio::sync::Notify::new());
+            let registry = ToolRegistry::new();
+            let oracle_release = Arc::clone(&release);
+            let oracle_finished = Arc::clone(&finished);
+            let body = if is_error {
+                "oracle failed: upstream unavailable"
+            } else {
+                "oracle actual answer: forty-two"
+            };
+            registry.register(
+                ToolDefinition::new_boxed(
+                    "oracle",
+                    "blocked oracle",
+                    "{}",
+                    Box::new(move |_, _| {
+                        let release = Arc::clone(&oracle_release);
+                        let finished = Arc::clone(&oracle_finished);
+                        Box::pin(async move {
+                            release.notified().await;
+                            finished.notify_one();
+                            if is_error {
+                                ToolResult::err("", body)
+                            } else {
+                                ToolResult::ok("", body)
+                            }
+                        })
+                    }),
+                )
+                .with_effect(ToolEffect::Network),
+            );
+            registry.register(
+                ToolDefinition::new_boxed(
+                    "release_oracle",
+                    "release and await oracle",
+                    "{}",
+                    Box::new(move |_, _| {
+                        let release = Arc::clone(&release);
+                        let finished = Arc::clone(&finished);
+                        Box::pin(async move {
+                            release.notify_one();
+                            finished.notified().await;
+                            // On this single-thread runtime the Network oracle
+                            // returns and sends its result without another yield
+                            // before this waiter can resume.
+                            ToolResult::ok("", "later synchronous result")
+                        })
+                    }),
+                )
+                .with_effect(ToolEffect::Process),
+            );
+            let requests = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let sink = Arc::clone(&events);
+            let mut agent = Agent::new();
+            agent.set_policy(Policy::full_access());
+            agent.set_tools(registry);
+            agent.async_tools.sync_window = Duration::from_millis(1);
+            agent.set_provider(Arc::new(RecordingProvider {
+                requests: Arc::clone(&requests),
+            }));
+            agent.subscribe(move |event| sink.lock().push(event.clone()));
+            tokio::time::timeout(Duration::from_secs(5), agent.prompt("consult the oracle"))
+                .await
+                .expect("prompt must finish")
+                .unwrap();
+
+            let requests = requests.lock();
+            assert_eq!(requests.len(), 3);
+            assert!(requests[1].iter().any(|m| m.role == Role::Tool
+                && m.tool_call_id.as_deref() == Some("oracle_call")
+                && m.content.contains("[running in background]")));
+            assert!(requests[2].iter().any(|m| m.role == Role::Tool
+                && m.tool_call_id.as_deref() == Some("release_call")
+                && m.content == "later synchronous result"));
+            let expected = format!(
+                "<background_result call=\"oracle_call\" tool=\"oracle\" status=\"{}\">\n{body}\n</background_result>",
+                if is_error { "error" } else { "done" }
+            );
+            assert_eq!(
+                requests[2]
+                    .iter()
+                    .filter(|m| m.role == Role::User && m.content == expected)
+                    .count(),
+                1,
+                "actual earlier background content must reach later inference (is_error={is_error})"
+            );
+            let events = events.lock();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event,
+                        Event::ToolBackgrounded(call) if call.id == "oracle_call"
+                    ))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event,
+                        Event::BackgroundResultArrived { call, is_error: error }
+                            if call.id == "oracle_call" && *error == is_error
+                    ))
+                    .count(),
+                1
+            );
+            assert!(!events.iter().any(|event| matches!(event,
+                Event::ToolBackgrounded(call) if call.id == "release_call"
+            )));
+        }
     }
 
     #[cfg(feature = "providers")]

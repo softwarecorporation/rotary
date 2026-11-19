@@ -23,7 +23,7 @@ pub enum HookDecision {
 pub type HookFn = Arc<dyn Fn(&HookEvent) -> HookDecision + Send + Sync>;
 
 pub struct HookRegistry {
-    hooks: Mutex<Vec<HookFn>>,
+    hooks: Mutex<Vec<(Option<&'static str>, HookFn)>>,
 }
 
 impl HookRegistry {
@@ -34,13 +34,27 @@ impl HookRegistry {
     }
 
     pub fn add(&self, hook: impl Fn(&HookEvent) -> HookDecision + Send + Sync + 'static) {
-        self.hooks.lock().push(Arc::new(hook));
+        self.hooks.lock().push((None, Arc::new(hook)));
+    }
+
+    /// Reconfigure one host hook without removing other hooks or changing order.
+    pub fn replace(
+        &self,
+        name: &'static str,
+        hook: impl Fn(&HookEvent) -> HookDecision + Send + Sync + 'static,
+    ) {
+        let mut hooks = self.hooks.lock();
+        if let Some((_, existing)) = hooks.iter_mut().find(|(key, _)| *key == Some(name)) {
+            *existing = Arc::new(hook);
+        } else {
+            hooks.push((Some(name), Arc::new(hook)));
+        }
     }
 
     /// Fire all hooks; ignore decisions (notify-only events).
     pub fn run_notify(&self, event: &HookEvent) {
         let hooks = self.hooks.lock().clone();
-        for h in &hooks {
+        for (_, h) in &hooks {
             let _ = h(event);
         }
     }
@@ -49,7 +63,7 @@ impl HookRegistry {
     pub fn run(&self, event: &HookEvent) -> HookDecision {
         let hooks = self.hooks.lock().clone();
         let mut modified: Option<String> = None;
-        for h in &hooks {
+        for (_, h) in &hooks {
             match h(event) {
                 HookDecision::Deny { reason } => {
                     return HookDecision::Deny { reason };
@@ -70,7 +84,7 @@ impl HookRegistry {
     pub fn run_before_tool(&self, tool: &ToolCall) -> Result<ToolCall, String> {
         let hooks = self.hooks.lock().clone();
         let mut call = tool.clone();
-        for h in &hooks {
+        for (_, h) in &hooks {
             match h(&HookEvent::BeforeTool { tool: call.clone() }) {
                 HookDecision::Deny { reason } => return Err(reason),
                 HookDecision::ModifyArgs { arguments } => {
@@ -112,6 +126,30 @@ mod tests {
         });
         registry.run_notify(&HookEvent::AfterTurn { turn: 0 });
         assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn replacing_host_hook_preserves_extension_gate_and_order() {
+        let registry = HookRegistry::new();
+        registry.replace("host", |_| HookDecision::Deny {
+            reason: "old scope".into(),
+        });
+        registry.add(|event| match event {
+            HookEvent::BeforeTool { tool } if tool.arguments == "new scope" => HookDecision::Deny {
+                reason: "extension gate".into(),
+            },
+            _ => panic!("host argument transformation must run first"),
+        });
+        registry.replace("host", |_| HookDecision::ModifyArgs {
+            arguments: "new scope".into(),
+        });
+        assert_eq!(registry.count(), 2);
+        let result = registry.run_before_tool(&ToolCall {
+            id: "1".into(),
+            name: "write".into(),
+            arguments: "original".into(),
+        });
+        assert_eq!(result.unwrap_err(), "extension gate");
     }
 
     #[test]

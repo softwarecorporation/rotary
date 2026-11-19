@@ -114,6 +114,7 @@ async fn execute_list_subagents(
                 "depth": handle.depth(),
                 "children": handle.children().len(),
                 "descendants": handle.descendant_count(),
+                "result": handle.result(),
             })
         })
         .collect::<Vec<_>>();
@@ -337,7 +338,7 @@ pub fn register_spawn_agent_tool(registry: &ToolRegistry, manager: Arc<Mutex<Sub
     registry.register(
         ToolDefinition::new_boxed(
             "list_subagents",
-            "List subagents spawned by this session and their current status.",
+            "List this session's subagents, status and completed results. A null result means it is still running.",
             r#"{"type":"object","properties":{}}"#,
             Box::new(move |ctx, args| {
                 let manager = Arc::clone(&list_manager);
@@ -788,7 +789,10 @@ mod tests {
                 _: &[serde_json::Value],
                 _: Option<&str>,
             ) -> Result<crate::provider::StreamResult, crate::provider::ProviderError> {
-                Ok(Box::new(futures::stream::pending()))
+                Ok(Box::new(futures::stream::iter([
+                    Ok(crate::provider::StreamEvent::Delta("fixture child completed".into())),
+                    Ok(crate::provider::StreamEvent::Done),
+                ])))
             }
         }
         manager.lock().set_provider(Arc::new(FixtureProvider));
@@ -807,11 +811,19 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
+        let handle = manager.lock().get(&id).unwrap().clone();
+        handle.wait().await;
         let listed = registry
             .execute("list_subagents", &ctx, "{}")
             .await
             .unwrap();
         assert!(listed.content.contains(&id));
+        let entries: serde_json::Value = serde_json::from_str(&listed.content).unwrap();
+        assert_eq!(
+            entries[0]["result"]["output"],
+            "fixture child completed"
+        );
+        assert!(entries[0]["result"]["error"].is_null());
         let cancelled = registry
             .execute(
                 "cancel_subagent",
