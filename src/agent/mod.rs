@@ -2748,6 +2748,7 @@ impl Agent {
         let mut tool_ctx = ToolContext::new(self.workspace_root.clone());
         tool_ctx.provider = self.provider.clone();
         tool_ctx.tools = Some(Arc::clone(&self.tools));
+        tool_ctx.session_messages = Some(self.messages_handle());
         tool_ctx.os_sandbox_required = self.policy.enable_os_sandbox && self.os_sandbox.is_none();
         tool_ctx.cancellation = self.turn_cancellation.reset();
         tool_ctx.hashline_sight = Arc::clone(&self.hashline_sight);
