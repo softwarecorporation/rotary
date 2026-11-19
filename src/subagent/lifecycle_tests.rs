@@ -619,6 +619,7 @@ async fn inherited_required_os_sandbox_refuses_shell_without_a_runner() {
     let mut authority = parent.subagent_authority();
     authority.policy.enable_os_sandbox = true;
     authority.os_sandbox_failed = true;
+    authority.os_sandbox = None;
     let mut manager = SubagentManager::new()
         .with_tools(Arc::new(tools))
         .with_authority(authority)
@@ -637,12 +638,16 @@ async fn inherited_required_os_sandbox_refuses_shell_without_a_runner() {
         .unwrap();
     settled(&h).await;
     assert!(!workspace.path().join("forbidden-marker").exists());
-    assert!(h
-        .snapshot()
-        .session
-        .provider_messages()
-        .iter()
-        .any(|m| m.role == crate::provider::Role::Tool && m.content.contains("sandbox")));
+    let snapshot = h.snapshot();
+    assert!(
+        snapshot
+            .session
+            .provider_messages()
+            .iter()
+            .any(|m| m.role == crate::provider::Role::Tool && m.content.contains("sandbox")),
+        "missing sandbox denial: {:?}",
+        snapshot.session.provider_messages()
+    );
 }
 
 struct FailureProvider;
