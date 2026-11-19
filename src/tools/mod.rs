@@ -789,7 +789,10 @@ mod tests {
                 _: &[serde_json::Value],
                 _: Option<&str>,
             ) -> Result<crate::provider::StreamResult, crate::provider::ProviderError> {
-                Ok(Box::new(futures::stream::pending()))
+                Ok(Box::new(futures::stream::iter([
+                    Ok(crate::provider::StreamEvent::Delta("fixture child completed".into())),
+                    Ok(crate::provider::StreamEvent::Done),
+                ])))
             }
         }
         manager.lock().set_provider(Arc::new(FixtureProvider));
@@ -818,7 +821,7 @@ mod tests {
         let entries: serde_json::Value = serde_json::from_str(&listed.content).unwrap();
         assert_eq!(
             entries[0]["result"]["output"],
-            "subagent explore completed offline for prompt: inspect"
+            "fixture child completed"
         );
         assert!(entries[0]["result"]["error"].is_null());
         let cancelled = registry
