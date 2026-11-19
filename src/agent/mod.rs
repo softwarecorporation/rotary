@@ -587,6 +587,7 @@ pub struct Agent {
     /// budget is per-turn rather than per-agent.
     pub self_healing: Option<SelfHealingRetry>,
     pub provider: Option<Arc<dyn Provider>>,
+    subagent_provider: Option<Arc<dyn Provider>>,
     pub max_tool_iterations: usize,
     pub auto_compact_after: usize,
     /// Opt-in session todo engine. `None` preserves the historical builtin tool.
@@ -693,6 +694,7 @@ impl Agent {
             async_tools: AsyncToolsConfig::default(),
             authorizer: None,
             provider: None,
+            subagent_provider: None,
             max_tool_iterations: 50,
             auto_compact_after: 0,
             todo_config: None,
@@ -960,6 +962,12 @@ impl Agent {
 
     pub fn set_provider(&mut self, provider: Arc<dyn Provider>) {
         self.provider = Some(provider);
+    }
+
+    /// Override the provider available to nested-agent tools without changing
+    /// foreground inference. None preserves inheritance from the current agent.
+    pub fn set_subagent_provider(&mut self, provider: Option<Arc<dyn Provider>>) {
+        self.subagent_provider = provider;
     }
 
     /// Snapshot the authority that a model-requested subagent may inherit.
@@ -1723,7 +1731,6 @@ impl Agent {
         self.before_prompt_hooks(&safe_text).await;
 
         let mut tool_ctx = self.tool_context();
-        tool_ctx.provider = Some(provider.clone());
         tool_ctx.tools = Some(Arc::clone(&self.tools));
         let pending_scope = Arc::new(parking_lot::Mutex::new(None));
         tool_ctx.pending_scope = Some(Arc::clone(&pending_scope));
@@ -2863,7 +2870,10 @@ impl Agent {
         {
             tool_ctx.script_run_id = Some(self.script_run_id.clone());
         }
-        tool_ctx.provider = self.provider.clone();
+        tool_ctx.provider = self
+            .subagent_provider
+            .clone()
+            .or_else(|| self.provider.clone());
         tool_ctx.tools = Some(Arc::clone(&self.tools));
         tool_ctx.session_messages = Some(self.messages_handle());
         tool_ctx.os_sandbox_required = self.policy.enable_os_sandbox && self.os_sandbox.is_none();
