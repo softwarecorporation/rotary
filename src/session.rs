@@ -721,10 +721,22 @@ impl Session {
         let _ = conn.execute("ALTER TABLE entries ADD COLUMN tool_calls TEXT", []);
 
         let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let has_todos: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'todos')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if !has_todos {
+            tx.execute("ALTER TABLE sessions ADD COLUMN todos TEXT", [])
+                .map_err(|e| e.to_string())?;
+        }
+        let todos = serde_json::to_string(&self.todos).map_err(|e| e.to_string())?;
 
         tx.execute(
-            "INSERT OR REPLACE INTO sessions (id, name, next_id) VALUES (?1, ?2, ?3)",
-            params![self.id, self.name, self.next_id as i64],
+            "INSERT OR REPLACE INTO sessions (id, name, next_id, todos) VALUES (?1, ?2, ?3, ?4)",
+            params![self.id, self.name, self.next_id as i64, todos],
         )
         .map_err(|e| e.to_string())?;
         tx.execute(
@@ -841,6 +853,26 @@ impl Session {
 
         for row in rows {
             session.entries.push(row.map_err(|e| e.to_string())?);
+        }
+        let has_todos: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'todos')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if has_todos {
+            let raw: Option<String> = conn
+                .query_row(
+                    "SELECT todos FROM sessions WHERE id = ?1",
+                    params![id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            if let Some(raw) = raw {
+                session.todos = serde_json::from_str(&raw)
+                    .map_err(|e| format!("invalid session todos: {e}"))?;
+            }
         }
         let _ = conn.execute("ALTER TABLE sessions ADD COLUMN projections TEXT", []);
         if let Ok(Some(raw)) = conn.query_row(
@@ -1231,6 +1263,146 @@ not valid json at all
         assert!(s.entries[0].content.contains(&secret));
         assert_eq!(loaded.todos.items.len(), 1);
         assert_eq!(loaded.todos.items[0].content, "a task");
+    }
+
+    #[cfg(feature = "sqlite-sessions")]
+    #[test]
+    fn sqlite_todos_survive_updates_and_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("todos.db");
+        let mut session = Session::new("todos", "recovery");
+
+        for step in 0..4 {
+            match step {
+                1 => {
+                    session.todos.items = vec![
+                        crate::todo::TodoItem {
+                            id: "first".into(),
+                            content: "verify persisted work".into(),
+                            status: crate::todo::TodoStatus::PendingVerification,
+                            creation_confidence: 63,
+                            completion_confidence: Some(91),
+                            verification_attempts: 2,
+                        },
+                        crate::todo::TodoItem {
+                            id: "second".into(),
+                            content: "next task".into(),
+                            status: crate::todo::TodoStatus::Pending,
+                            creation_confidence: 78,
+                            completion_confidence: None,
+                            verification_attempts: 0,
+                        },
+                    ];
+                }
+                2 => {
+                    session.todos.items.remove(1);
+                    session.todos.items[0].content = "verified work".into();
+                    session.todos.items[0].status = crate::todo::TodoStatus::Completed;
+                    session.todos.items[0].verification_attempts = 3;
+                }
+                3 => session.todos.items.clear(),
+                _ => {}
+            }
+            let expected = session.todos.clone();
+            session.save_sqlite(&path).unwrap();
+            drop(session);
+
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            let raw: String = conn
+                .query_row("SELECT todos FROM sessions WHERE id = 'todos'", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(serde_json::from_str::<TodoState>(&raw).unwrap(), expected);
+            drop(conn);
+
+            session = Session::load_sqlite(&path).unwrap();
+            assert_eq!(session.todos, expected, "restart after step {step}");
+        }
+    }
+
+    #[cfg(feature = "sqlite-sessions")]
+    #[test]
+    fn sqlite_todos_legacy_and_corrupt_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.db");
+        let session = Session::new("legacy", "legacy");
+        session.save_sqlite(&path).unwrap();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute("ALTER TABLE sessions DROP COLUMN todos", [])
+            .unwrap();
+        assert_eq!(
+            Session::load_sqlite(&path).unwrap().todos,
+            TodoState::default()
+        );
+        let columns: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'todos'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            columns, 0,
+            "loading legacy todos must not migrate the schema"
+        );
+
+        session.save_sqlite(&path).unwrap();
+        conn.execute("UPDATE sessions SET todos = NULL", [])
+            .unwrap();
+        assert_eq!(
+            Session::load_sqlite(&path).unwrap().todos,
+            TodoState::default()
+        );
+        conn.execute("UPDATE sessions SET todos = 'not json'", [])
+            .unwrap();
+        assert!(Session::load_sqlite(&path)
+            .unwrap_err()
+            .contains("invalid session todos"));
+    }
+
+    #[cfg(feature = "sqlite-sessions")]
+    #[test]
+    fn sqlite_todos_save_failure_preserves_previous_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("failure.db");
+        let mut session = Session::new("todos", "before");
+        session.append(Role::User, "original entry");
+        session.todos.items.push(crate::todo::TodoItem {
+            id: "task".into(),
+            content: "original task".into(),
+            status: crate::todo::TodoStatus::InProgress,
+            creation_confidence: 81,
+            completion_confidence: None,
+            verification_attempts: 0,
+        });
+        session.save_sqlite(&path).unwrap();
+        let previous_todos = session.todos.clone();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER reject_todo_insert BEFORE INSERT ON sessions
+             WHEN NEW.todos LIKE '%reject%'
+             BEGIN SELECT RAISE(ABORT, 'todo write rejected'); END;
+             CREATE TRIGGER reject_todo_update BEFORE UPDATE OF todos ON sessions
+             WHEN NEW.todos LIKE '%reject%'
+             BEGIN SELECT RAISE(ABORT, 'todo write rejected'); END;",
+        )
+        .unwrap();
+        drop(conn);
+        session.name = "after".into();
+        session.append(Role::Assistant, "new entry");
+        session.todos.items[0].content = "reject this write".into();
+        assert!(session
+            .save_sqlite(&path)
+            .unwrap_err()
+            .contains("todo write rejected"));
+        drop(session);
+
+        let recovered = Session::load_sqlite(&path).unwrap();
+        assert_eq!(recovered.name, "before");
+        assert_eq!(recovered.entries.len(), 1);
+        assert_eq!(recovered.entries[0].content, "original entry");
+        assert_eq!(recovered.todos, previous_todos);
     }
 
     #[cfg(feature = "sqlite-sessions")]
