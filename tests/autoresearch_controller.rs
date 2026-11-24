@@ -1,8 +1,9 @@
 #![cfg(unix)]
 
 use rx4::{
-    AutoresearchBudget, AutoresearchController, AutoresearchControllerConfig, AutoresearchEvent,
-    CompletionReason, ExperimentHypothesis, HypothesisOutcome, IterationStatus,
+    AutoresearchBudget, AutoresearchController, AutoresearchControllerConfig,
+    AutoresearchControllerError, AutoresearchEvent, CompletionReason, ExperimentHypothesis,
+    HypothesisOutcome, IterationStatus,
 };
 use std::path::Path;
 use std::process::Command;
@@ -41,6 +42,66 @@ fn repository(initial_state: &str) -> TempDir {
 
 fn config(measure: &str, checks: &str) -> AutoresearchControllerConfig {
     AutoresearchControllerConfig::new("test", "score", measure, checks)
+}
+
+#[tokio::test]
+async fn constructor_preserves_path_validation_errors() {
+    let repo = repository("base");
+    let missing = repo.path().join("missing");
+    assert!(matches!(
+        AutoresearchController::new(&missing, config("true", "true")).await,
+        Err(AutoresearchControllerError::Io(error))
+            if error.kind() == std::io::ErrorKind::NotFound
+    ));
+
+    let file = std::fs::canonicalize(repo.path().join("state")).unwrap();
+    assert!(matches!(
+        AutoresearchController::new(&file, config("true", "true")).await,
+        Err(AutoresearchControllerError::InvalidConfig(message))
+            if message == format!("workspace is not a directory: {}", file.display())
+    ));
+
+    let subdir = repo.path().join("subdir");
+    std::fs::create_dir(&subdir).unwrap();
+    assert!(matches!(
+        AutoresearchController::new(&subdir, config("true", "true")).await,
+        Err(AutoresearchControllerError::InvalidConfig(message))
+            if message == "controller root must be the Git repository root"
+    ));
+
+    std::fs::write(repo.path().join("state"), "dirty").unwrap();
+    assert!(matches!(
+        AutoresearchController::new(repo.path(), config("true", "true")).await,
+        Err(AutoresearchControllerError::InvalidConfig(message))
+            if message == "workspace must be clean before starting an experiment"
+    ));
+}
+
+#[tokio::test]
+async fn constructor_canonicalizes_symlink_and_parent_components() {
+    let repo = repository("base");
+    let aliases = tempfile::tempdir().unwrap();
+    let alias = aliases.path().join("repo-link");
+    std::os::unix::fs::symlink(repo.path(), &alias).unwrap();
+    let child = repo.path().join("child");
+    std::fs::create_dir(&child).unwrap();
+    let mut controller =
+        AutoresearchController::new(alias.join("child").join(".."), config("true", "true"))
+            .await
+            .unwrap();
+    assert_eq!(
+        controller.root(),
+        std::fs::canonicalize(repo.path()).unwrap()
+    );
+    assert_eq!(
+        controller.base_commit(),
+        git(repo.path(), &["rev-parse", "HEAD"])
+    );
+    assert_eq!(
+        std::fs::read_to_string(controller.workspace_path().join("state")).unwrap(),
+        "base"
+    );
+    controller.close().await.unwrap();
 }
 
 #[tokio::test]
