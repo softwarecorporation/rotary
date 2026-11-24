@@ -79,7 +79,7 @@ reqwest = { version = "0.12", features = ["json", "stream", "blocking"], default
 eventsource-stream = { version = "0.2", optional = true }
 futures = { version = "0.3", optional = true }
 regex = { version = "1", optional = true }
-fff-search = { version = "0.10.2-nightly.686a849", optional = true }
+fff-search = { version = "=0.10.2-nightly.1eb913e", optional = true }
 
 # Optional — sandboxed LuaJIT for the `script` tool
 mlua = { version = "0.10", default-features = false, features = ["luajit", "vendored"], optional = true }
