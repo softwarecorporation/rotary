@@ -2184,33 +2184,41 @@ mod tests {
     #[cfg(feature = "providers")]
     #[tokio::test]
     async fn model_spawn_agent_automatically_inherits_parent_authority() {
-        let workspace = tempfile::tempdir().expect("workspace");
-        let permission_checks = Arc::new(AtomicUsize::new(0));
-        let tools = ToolRegistry::new();
-        crate::tools::register_builtin_tools(&tools);
-        let mut parent = Agent::new();
-        parent.set_workspace_root(workspace.path());
-        parent.set_scope(Scope::Coding);
-        parent.set_policy(Policy::read_only());
-        parent.set_authorizer(Arc::new(DenyWriteAuthorizer {
-            calls: Arc::clone(&permission_checks),
-        }));
-        parent.set_provider(Arc::new(DelegatingProvider {
-            parent_spawned: AtomicUsize::new(0),
-            child_write_emitted: AtomicUsize::new(0),
-        }));
-        parent.set_tools(tools);
-
-        parent.prompt("parent task").await.expect("parent prompt");
-        for _ in 0..20 {
-            if permission_checks.load(Ordering::SeqCst) == 2 {
-                break;
+        for host_registered in [false, true] {
+            let workspace = tempfile::tempdir().expect("workspace");
+            let permission_checks = Arc::new(AtomicUsize::new(0));
+            let tools = ToolRegistry::new();
+            crate::tools::register_builtin_tools(&tools);
+            if host_registered {
+                let mut host = Agent::new();
+                host.set_policy(Policy::full_access());
+                let manager = SubagentManager::new().with_authority(host.subagent_authority());
+                crate::tools::register_spawn_agent_tool(&tools, Arc::new(Mutex::new(manager)));
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+            let mut parent = Agent::new();
+            parent.set_workspace_root(workspace.path());
+            parent.set_scope(Scope::Coding);
+            parent.set_policy(Policy::read_only());
+            parent.set_authorizer(Arc::new(DenyWriteAuthorizer {
+                calls: Arc::clone(&permission_checks),
+            }));
+            parent.set_provider(Arc::new(DelegatingProvider {
+                parent_spawned: AtomicUsize::new(0),
+                child_write_emitted: AtomicUsize::new(0),
+            }));
+            parent.set_tools(tools);
 
-        assert_eq!(permission_checks.load(Ordering::SeqCst), 2);
-        assert!(!workspace.path().join("blocked.txt").exists());
+            parent.prompt("parent task").await.expect("parent prompt");
+            for _ in 0..20 {
+                if permission_checks.load(Ordering::SeqCst) == 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+
+            assert_eq!(permission_checks.load(Ordering::SeqCst), 2);
+            assert!(!workspace.path().join("blocked.txt").exists());
+        }
     }
 
     #[cfg(feature = "providers")]
